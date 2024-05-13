@@ -14,12 +14,35 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
+
+func createTestFile(t *testing.T, name string) string {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), name)
+	assert.Nil(t, err)
+	defer f.Close()
+
+	err = binary.Write(f, binary.LittleEndian, []byte("GGUF"))
+	assert.Nil(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint32(3))
+	assert.Nil(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint64(0))
+	assert.Nil(t, err)
+
+	err = binary.Write(f, binary.LittleEndian, uint64(0))
+	assert.Nil(t, err)
+
+	return f.Name()
+}
 
 func Test_Routes(t *testing.T) {
 	type testCase struct {
@@ -28,28 +51,6 @@ func Test_Routes(t *testing.T) {
 		Path     string
 		Setup    func(t *testing.T, req *http.Request)
 		Expected func(t *testing.T, resp *http.Response)
-	}
-
-	createTestFile := func(t *testing.T, name string) string {
-		t.Helper()
-
-		f, err := os.CreateTemp(t.TempDir(), name)
-		assert.Nil(t, err)
-		defer f.Close()
-
-		err = binary.Write(f, binary.LittleEndian, []byte("GGUF"))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint32(3))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint64(0))
-		assert.Nil(t, err)
-
-		err = binary.Write(f, binary.LittleEndian, uint64(0))
-		assert.Nil(t, err)
-
-		return f.Name()
 	}
 
 	createTestModel := func(t *testing.T, name string) {
@@ -232,6 +233,155 @@ func Test_Routes(t *testing.T) {
 
 			if tc.Expected != nil {
 				tc.Expected(t, resp)
+			}
+		})
+	}
+}
+
+type testResponseRecorder struct {
+	httptest.ResponseRecorder
+	http.CloseNotifier
+}
+
+func CreateTestResponseRecorder() *testResponseRecorder {
+	return &testResponseRecorder{
+		ResponseRecorder: *httptest.NewRecorder(),
+	}
+}
+
+func (r *testResponseRecorder) CloseNotify() <-chan bool {
+	return make(chan bool)
+}
+
+func TestCaseSensitivity(t *testing.T) {
+	cases := []string{
+		"mistral",
+		"llama3:latest",
+		"library/phi3:q4_0",
+		"registry.ollama.ai/library/gemma:q5_K_M",
+		// TODO: host:port currently fails on windows (#4107)
+		// "localhost:5000/alice/bob:latest",
+	}
+
+	for _, tt := range cases {
+		t.Run(tt, func(t *testing.T) {
+			t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+			var s Server
+			stream := false
+
+			createRequest := func(name string) io.Reader {
+				modelfile := fmt.Sprintf("FROM %s", createTestFile(t, "empty"))
+
+				var b bytes.Buffer
+				if err := json.NewEncoder(&b).Encode(api.CreateRequest{Name: name, Modelfile: modelfile, Stream: &stream}); err != nil {
+					t.Fatal(err)
+				}
+
+				return &b
+			}
+
+			{
+				w := CreateTestResponseRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/create", createRequest(tt))
+
+				s.CreateModelHandler(c)
+
+				wantCode := http.StatusOK
+				if w.Code != wantCode {
+					t.Fatalf("expected status %d, got %d", wantCode, w.Code)
+				}
+			}
+
+			{
+				w := CreateTestResponseRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/create", createRequest(strings.ToUpper(tt)))
+
+				s.CreateModelHandler(c)
+
+				wantCode := http.StatusBadRequest
+				if w.Code != wantCode {
+					t.Fatalf("expected status %d, got %d", wantCode, w.Code)
+				}
+
+				var r struct {
+					Error string `json:"error"`
+				}
+
+				if err := json.NewDecoder(w.Body).Decode(&r); err != nil {
+					t.Fatal(err)
+				}
+
+				wantError := "a model with that name already exists"
+				if r.Error != wantError {
+					t.Fatalf("expected error %q, got %q", wantError, r.Error)
+				}
+			}
+
+			{
+				w := CreateTestResponseRecorder()
+				c, _ := gin.CreateTestContext(w)
+
+				var b bytes.Buffer
+				if err := json.NewEncoder(&b).Encode(api.PullRequest{Name: strings.ToUpper(tt), Stream: &stream}); err != nil {
+					t.Fatal(err)
+				}
+
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/pull", &b)
+
+				s.PullModelHandler(c)
+
+				wantCode := http.StatusBadRequest
+				if w.Code != wantCode {
+					t.Fatalf("expected status %d, got %d", wantCode, w.Code)
+				}
+
+				var r struct {
+					Error string `json:"error"`
+				}
+
+				if err := json.NewDecoder(w.Body).Decode(&r); err != nil {
+					t.Fatal(err)
+				}
+
+				wantError := "a model with that name already exists"
+				if r.Error != wantError {
+					t.Fatalf("expected error %q, got %q", wantError, r.Error)
+				}
+			}
+
+			{
+				w := CreateTestResponseRecorder()
+				c, _ := gin.CreateTestContext(w)
+
+				var b bytes.Buffer
+				if err := json.NewEncoder(&b).Encode(api.CopyRequest{Source: tt, Destination: strings.ToUpper(tt)}); err != nil {
+					t.Fatal(err)
+				}
+
+				c.Request = httptest.NewRequest(http.MethodPost, "/api/copy", &b)
+
+				s.CopyModelHandler(c)
+
+				wantCode := http.StatusBadRequest
+				if w.Code != wantCode {
+					t.Fatalf("expected status %d, got %d", wantCode, w.Code)
+				}
+
+				var r struct {
+					Error string `json:"error"`
+				}
+
+				if err := json.NewDecoder(w.Body).Decode(&r); err != nil {
+					t.Fatal(err)
+				}
+
+				wantError := "a model with that name already exists"
+				if r.Error != wantError {
+					t.Fatalf("expected error %q, got %q", wantError, r.Error)
+				}
 			}
 		})
 	}
